@@ -1,0 +1,339 @@
+openapi: 3.1.0
+info:
+  title: Leave Management API — Submit Leave Request
+  version: 1.0.0
+  description: >
+    Contract for feature 001-submit-leave-request. The employee is always derived from the
+    authenticated token; no endpoint accepts an employee identifier from the client.
+    Error codes are catalogued in errors.md.
+servers:
+  - url: /api/v1
+security:
+  - bearerAuth: []
+paths:
+  /leave-requests:
+    post:
+      operationId: submitLeaveRequest
+      summary: Submit a leave request for the authenticated employee
+      tags: [LeaveRequests]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubmitLeaveRequest'
+            example:
+              leaveTypeCode: ANNUAL
+              startDate: '2027-03-12'
+              endDate: '2027-03-16'
+              reason: Family trip
+      responses:
+        '201':
+          description: Request created in Pending status with its days reserved.
+          headers:
+            Location:
+              description: URL of the created request (/api/v1/leave-requests/{id}).
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LeaveRequestResponse'
+        '400':
+          $ref: '#/components/responses/ValidationProblem'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/ConcurrencyConflict'
+        '422':
+          $ref: '#/components/responses/BusinessRuleProblem'
+        '500':
+          $ref: '#/components/responses/ServerError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /leave-requests/{id}:
+    get:
+      operationId: getOwnLeaveRequest
+      summary: Get one of the authenticated employee's own leave requests
+      description: >
+        Resource-level authorization: only the authenticated employee's own requests are
+        returned. Returns 404 when the request does not exist or belongs to another employee
+        (identical responses), so other employees' requests cannot be discovered. Managers and
+        HR have no access through this endpoint.
+      tags: [LeaveRequests]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: The request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LeaveRequestResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /health/live:
+    servers:
+      - url: /
+    get:
+      operationId: getLiveness
+      summary: Liveness probe (the process is running)
+      description: Anonymous by design (Constitution IV). Runs no dependency checks.
+      tags: [Health]
+      security: []
+      responses:
+        '200':
+          description: Healthy
+          content:
+            text/plain:
+              schema:
+                type: string
+  /health/ready:
+    servers:
+      - url: /
+    get:
+      operationId: getReadiness
+      summary: Readiness probe (dependencies such as SQL Server are reachable)
+      description: Anonymous by design (Constitution IV).
+      tags: [Health]
+      security: []
+      responses:
+        '200':
+          description: Healthy
+          content:
+            text/plain:
+              schema:
+                type: string
+        '503':
+          description: Unhealthy
+          content:
+            text/plain:
+              schema:
+                type: string
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    SubmitLeaveRequest:
+      type: object
+      description: >
+        Unknown properties (for example employeeId, status, countedDays, balance) are ignored
+        and never influence the outcome (FR-009). Dates are strings in yyyy-MM-dd format so that
+        format errors are reported together with other field errors (research R7).
+      required: [leaveTypeCode, startDate, endDate, reason]
+      properties:
+        leaveTypeCode:
+          type: string
+          maxLength: 50
+          description: Code of an active leave type.
+        startDate:
+          type: string
+          format: date
+          description: First day of leave (yyyy-MM-dd), inclusive.
+        endDate:
+          type: string
+          format: date
+          description: Last day of leave (yyyy-MM-dd), inclusive; not earlier than startDate.
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 500
+          description: Free text; must not be blank. Never logged.
+    LeaveRequestResponse:
+      type: object
+      required:
+        - id
+        - employeeId
+        - leaveType
+        - startDate
+        - endDate
+        - countedDays
+        - reason
+        - status
+        - reviewRoute
+        - submittedAt
+      properties:
+        id:
+          type: string
+          format: uuid
+        employeeId:
+          type: string
+          format: uuid
+          description: Internal id of the owning (authenticated) employee.
+        leaveType:
+          type: object
+          required: [code, name]
+          properties:
+            code:
+              type: string
+            name:
+              type: string
+        startDate:
+          type: string
+          format: date
+        endDate:
+          type: string
+          format: date
+        countedDays:
+          type: integer
+          minimum: 1
+          description: Working days (Mon–Fri, excluding public holidays) reserved by this request.
+        reason:
+          type: string
+        status:
+          type: string
+          enum: [Pending, Approved, Rejected, Cancelled]
+          description: Always Pending immediately after submission.
+        reviewRoute:
+          type: string
+          enum: [Manager, FallbackReviewer]
+          description: Who will review the request (FR-021).
+        submittedAt:
+          type: string
+          format: date-time
+    ProblemDetails:
+      type: object
+      description: RFC 9457 Problem Details with project extensions.
+      required: [type, title, status, traceId]
+      properties:
+        type:
+          type: string
+          format: uri-reference
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string
+        traceId:
+          type: string
+          description: Correlation id; also present in server logs.
+        errorCode:
+          type: string
+          description: Stable machine-readable code (see errors.md). Present on 409, 422, 403, 503.
+    ValidationProblemDetails:
+      allOf:
+        - $ref: '#/components/schemas/ProblemDetails'
+        - type: object
+          required: [errors]
+          properties:
+            errors:
+              type: object
+              description: Field name → list of messages. All input problems are reported together.
+              additionalProperties:
+                type: array
+                items:
+                  type: string
+    BusinessRuleProblemDetails:
+      allOf:
+        - $ref: '#/components/schemas/ProblemDetails'
+        - type: object
+          required: [errorCode]
+          properties:
+            requestedDays:
+              type: integer
+              description: Present for LEAVE_INSUFFICIENT_BALANCE.
+            availableDays:
+              type: integer
+              description: Present for LEAVE_INSUFFICIENT_BALANCE. Whole days (research R10).
+            leaveYear:
+              type: integer
+              description: >
+                Present for LEAVE_BALANCE_NOT_AVAILABLE (and LEAVE_HOLIDAY_CALENDAR_NOT_AVAILABLE
+                if business rule B1 is approved).
+            overlappingRequestId:
+              type: string
+              format: uuid
+              description: >
+                Present for LEAVE_OVERLAP. On a client retry, GET this id and compare details to
+                confirm whether it is the original submission (research R15).
+  responses:
+    ValidationProblem:
+      description: One or more input fields are missing or invalid.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ValidationProblemDetails'
+          example:
+            type: https://httpstatuses.io/400
+            title: One or more validation errors occurred.
+            status: 400
+            traceId: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+            errors:
+              leaveTypeCode: [Leave type is required.]
+              endDate: [End date must not be earlier than start date.]
+    BusinessRuleProblem:
+      description: >
+        The request is well-formed but violates a documented business rule (stable errorCode,
+        see errors.md).
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/BusinessRuleProblemDetails'
+          example:
+            type: /problems/leave-insufficient-balance
+            title: Insufficient leave balance
+            status: 422
+            detail: The request needs 3 days but only 2 are available for ANNUAL in 2027.
+            errorCode: LEAVE_INSUFFICIENT_BALANCE
+            requestedDays: 3
+            availableDays: 2
+            traceId: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+    Unauthorized:
+      description: No valid authentication was provided.
+      headers:
+        WWW-Authenticate:
+          schema:
+            type: string
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    Forbidden:
+      description: Authenticated, but no active employee record is linked to the caller.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    NotFound:
+      description: Not found (or not owned by the caller).
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    ConcurrencyConflict:
+      description: >
+        Genuine state or concurrency conflict (errorCode CONCURRENCY_CONFLICT): the data changed
+        while the request was processed. Nothing was saved; retrying is safe.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    ServerError:
+      description: Unexpected error. No internal details are returned.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    Unavailable:
+      description: The request could not be processed in time (for example, a lock wait timeout). Nothing was saved.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'

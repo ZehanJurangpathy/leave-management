@@ -1,0 +1,178 @@
+# Data Model: Submit Leave Request
+
+**Feature**: [spec.md](./spec.md) | **Plan**: [plan.md](./plan.md) | **Date**: 2026-10-18
+(revised after Tech Lead review: identity mapping, integer balances, B1 pending)
+
+This describes Domain entities and their persistence constraints. Field types are logical; SQL
+types are noted where they carry a rule. Names are indicative and may be refined during
+implementation. This is not a migration script.
+
+## Overview
+
+```text
+Employee 1 ──── 0..1 Employee (reporting manager)
+Employee 1 ──── * LeaveBalance * ──── 1 LeaveType        (one per employee, type, year)
+Employee 1 ──── * LeaveRequest * ──── 1 LeaveType
+PublicHoliday (standalone calendar)
+PublicHolidayCalendarYear (completeness marker; only if B1 is approved)
+```
+
+Aggregate boundaries used by the submit use case:
+
+- **LeaveRequest** is created by this feature.
+- **LeaveBalance** is modified (reserved days increase).
+- **Employee**, **LeaveType**, **PublicHoliday** are read only. They are maintained outside this
+  feature (spec A3, A11); this feature provides no endpoints to manage them.
+
+---
+
+## Employee
+
+Represents a person who can request leave.
+
+| Field | Type | Rules |
+|---|---|---|
+| Id | GUID | Primary key. Internal identifier used in logs and responses. |
+| IdentityIssuer | string (≤ 300) | Required. Token issuer (`iss`) the subject belongs to. |
+| IdentitySubject | string (≤ 200) | Required. Value of the configured subject claim (`sub` by default; `oid` for Entra ID). Unique together with IdentityIssuer (research R8). |
+| ManagerId | GUID? | Optional FK → Employee. Null means no reporting manager (FR-021). Cannot reference itself. |
+| IsActive | bool | Inactive employees cannot submit (US4 #4). |
+
+Responsibilities in Domain: expose whether the employee may submit and who reviews their requests
+(`Manager` when `ManagerId` is set, otherwise `FallbackReviewer`).
+
+Constraints: unique `(IdentityIssuer, IdentitySubject)`; `ManagerId <> Id`.
+
+Persistence: this row is the **concurrency anchor** for everything belonging to the employee.
+Every write path that changes the employee's requests or balances takes an update lock on it
+first (research R1.3, rules L1–L6). No personal data (name, email) is needed by this feature, and
+mutable attributes are never used for identity matching.
+
+## LeaveType
+
+| Field | Type | Rules |
+|---|---|---|
+| Id | GUID | Primary key. |
+| Code | string (≤ 50) | Required, unique, stable (e.g., `ANNUAL`). Used in API contracts. |
+| Name | string (≤ 100) | Required. Display name. |
+| IsActive | bool | Only active types can be requested (FR-004). |
+
+## LeaveBalance
+
+The days available to one employee for one leave type in one leave year.
+
+| Field | Type | Rules |
+|---|---|---|
+| Id | GUID | Primary key. |
+| EmployeeId | GUID | FK → Employee. |
+| LeaveTypeId | GUID | FK → LeaveType. |
+| LeaveYear | int | Calendar year (FR-020), e.g., 2027. |
+| EntitlementDays | int (whole days) | ≥ 0. Maintained outside this feature. |
+| UsedDays | int (whole days) | ≥ 0. Days of Approved requests. Changed by the approval feature. |
+| ReservedDays | int (whole days) | ≥ 0. Days of Pending requests. Increased by this feature. |
+| RowVersion | rowversion | Concurrency token (backstop, research R1). |
+
+Derived: `AvailableDays = EntitlementDays − UsedDays − ReservedDays` (FR-012). Not stored.
+
+Whole-day integers follow from A2 (unconfirmed) and the absence of any fractional-entitlement
+requirement; if either changes, precision must be revisited (research R10, T7).
+
+Constraints:
+
+- Unique `(EmployeeId, LeaveTypeId, LeaveYear)`.
+- Check: `UsedDays >= 0 AND ReservedDays >= 0 AND UsedDays + ReservedDays <= EntitlementDays`.
+
+Domain behavior:
+
+- `Reserve(days)`: if `days > AvailableDays` → error `LEAVE_INSUFFICIENT_BALANCE` with requested
+  and available days; otherwise `ReservedDays += days`.
+- (Future features) `ConvertReservationToUsed(days)` and `ReleaseReservation(days)`, each invoked
+  at most once per request because they are driven by the request's single status transition
+  (FR-012a).
+
+A missing balance row for `(employee, type, year)` means "balance not yet available"
+(FR-020a) — distinct from a row with zero available days ("insufficient balance").
+
+## PublicHoliday
+
+| Field | Type | Rules |
+|---|---|---|
+| Id | GUID | Primary key. |
+| Date | date | Required, unique. |
+| Name | string (≤ 100) | Required. |
+
+One organisation-wide calendar (A11). Holidays falling on weekends may exist; they have no effect
+on counting.
+
+**PublicHolidayCalendarYear** *(pending business approval of B1 — do not build until approved)*:
+`Year` (int, PK), `CompletedAt` (datetimeoffset). Presence means the holiday list for that year has
+been declared complete by its maintainer (data source: B3). Holiday rows without a marker do not
+prove completeness (research R16).
+
+## LeaveRequest
+
+| Field | Type | Rules |
+|---|---|---|
+| Id | GUID | Primary key, generated by the server. |
+| EmployeeId | GUID | FK → Employee. Always the authenticated employee (FR-008). |
+| LeaveTypeId | GUID | FK → LeaveType. |
+| StartDate | date | Required. |
+| EndDate | date | Required, ≥ StartDate (FR-003). |
+| LeaveYear | int | = year of StartDate = year of EndDate (FR-020). Stored for indexing and balance lookup. |
+| CountedDays | int | > 0 (FR-010a). Working days computed at submission (FR-010); snapshot, never recomputed by this feature. |
+| Reason | string (≤ 500) | Required, trimmed, not whitespace-only (FR-002, A5). Sensitive: never logged. |
+| Status | enum (string) | `Pending` on creation (FR-005). |
+| ReviewRoute | enum (string) | `Manager` or `FallbackReviewer` (FR-021). |
+| ReviewerEmployeeId | GUID? | The manager's Id when `ReviewRoute = Manager`; null for `FallbackReviewer`. |
+| SubmittedAt | datetimeoffset | Server time (UTC) via `TimeProvider`. |
+| RowVersion | rowversion | Concurrency token for future status transitions. |
+
+Constraints:
+
+- Check: `EndDate >= StartDate`, `CountedDays > 0`, `YEAR(StartDate) = YEAR(EndDate)`,
+  `LeaveYear = YEAR(StartDate)`.
+- Check: `ReviewRoute = 'Manager'` ⇔ `ReviewerEmployeeId IS NOT NULL`.
+- Index `(EmployeeId, Status, StartDate, EndDate)` for the overlap query.
+
+### Status lifecycle
+
+```text
+              submit (this feature)
+  (none) ───────────────────────────► Pending
+                                        │
+               approve (approval)       │       reject (approval) / cancel (cancellation)
+           ┌────────────────────────────┼─────────────────────────────┐
+           ▼                            │                             ▼
+        Approved ── cancel? (future, not yet specified) ──►       Rejected / Cancelled
+```
+
+- Only `Pending → Approved`, `Pending → Rejected`, `Pending → Cancelled` are defined so far. Each
+  transition happens at most once (FR-012a) and is enforced by Domain methods on `LeaveRequest`
+  plus the `RowVersion` token.
+- Whether an Approved request can be cancelled, and what that does to used days, belongs to the
+  cancellation feature and is not decided here.
+- Overlap blocking (FR-014) considers `Pending` and `Approved` only.
+
+### Submission invariants (Domain)
+
+Creating a `LeaveRequest` succeeds only when all of the following hold; otherwise a typed error is
+returned and nothing is created:
+
+| Rule | Error code | Source |
+|---|---|---|
+| Leave type exists and is active (checked before the transaction) | `LEAVE_TYPE_INVALID` | FR-004 |
+| Start date not before today (organisation time zone) | `LEAVE_START_IN_PAST` | A4 (unconfirmed) |
+| Start and end in the same calendar year | `LEAVE_SPANS_LEAVE_YEARS` | FR-020 |
+| Holiday calendar for the year marked complete | `LEAVE_HOLIDAY_CALENDAR_NOT_AVAILABLE` | B1 — **pending business approval**; omitted until approved |
+| Counted working days > 0 | `LEAVE_ZERO_WORKING_DAYS` | FR-010a |
+| No Pending/Approved request of the employee shares a calendar date | `LEAVE_OVERLAP` | FR-014 |
+| Balance exists for (employee, type, year) | `LEAVE_BALANCE_NOT_AVAILABLE` | FR-020a |
+| Counted days ≤ available days | `LEAVE_INSUFFICIENT_BALANCE` | FR-011 |
+
+Rules are evaluated in the order above so the first failing rule is reported deterministically;
+business rules are reported one at a time (unlike input validation, which reports all field errors
+together — FR-016 applies to input problems).
+
+Overlap is deliberately checked **before** the balance rules: a retried submission of an
+already-accepted request must be reported as `LEAVE_OVERLAP` with the original request's id
+(FR-018a, research R15), not as insufficient balance caused by its own earlier reservation.
